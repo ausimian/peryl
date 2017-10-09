@@ -1,24 +1,20 @@
-#include "/usr/include/python2.7/Python.h"
-#include "erl_driver.h"
+#include <stdio.h>
+#include "python2.7/Python.h"
+#include "erl_nif.h"
 
-static ErlDrvTid    tid_main;
-static ErlDrvCond*  cond_stop_requested;
-static ErlDrvMutex* mutex_stop_requested;
-
-typedef struct _peryl_drv_data {
-  ErlDrvPort port;
-} peryl_drv_data;
-
+static ErlNifTid    tid_main;
+static ErlNifCond*  cond_stop_requested;
+static ErlNifMutex* mutex_stop_requested;
 
 #define SAFE_COND_DESTROY(X)                    \
   if (X) {                                      \
-    erl_drv_cond_destroy(X);                    \
+    enif_cond_destroy(X);                       \
     X = NULL;                                   \
   }
 
 #define SAFE_MUTEX_DESTROY(X)                   \
   if (X) {                                      \
-    erl_drv_mutex_destroy(X);                   \
+    enif_mutex_destroy(X);                      \
     X = NULL;                                   \
   }
 
@@ -30,9 +26,9 @@ void peryl_destroy_vars() {
 
 static
 int peryl_create_vars() {
-  if (!(cond_stop_requested = erl_drv_cond_create("peryl_cond_stop_requested")))
+  if (!(cond_stop_requested = enif_cond_create("peryl_cond_stop_requested")))
     goto failed;
-  if (!(mutex_stop_requested = erl_drv_mutex_create("peryl_mutex_stop_requested")))
+  if (!(mutex_stop_requested = enif_mutex_create("peryl_mutex_stop_requested")))
     goto failed;
 
   return 0;
@@ -46,16 +42,16 @@ static
 void* peryl_py_thread(void* arg) {
 
   PyThreadState* threadState;
-  ErlDrvCond*    cond_started = (ErlDrvCond*)arg;
+  ErlNifCond*    cond_started = (ErlNifCond*)arg;
 
   Py_InitializeEx(0);
   PyEval_InitThreads();
   threadState = PyEval_SaveThread();
 
-  erl_drv_mutex_lock(mutex_stop_requested);
-  erl_drv_cond_signal(cond_started);
-  erl_drv_cond_wait(cond_stop_requested, mutex_stop_requested);
-  erl_drv_mutex_unlock(mutex_stop_requested);
+  enif_mutex_lock(mutex_stop_requested);
+  enif_cond_signal(cond_started);
+  enif_cond_wait(cond_stop_requested, mutex_stop_requested);
+  enif_mutex_unlock(mutex_stop_requested);
 
   PyEval_RestoreThread(threadState);
   Py_Finalize();
@@ -65,30 +61,29 @@ void* peryl_py_thread(void* arg) {
 
 
 static
-int peryl_drv_init(void) {
+int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
 
   int init_res = -1;
-  ErlDrvSysInfo si;
-  ErlDrvCond*   cond_started;
-  ErlDrvMutex*  mutex_started;
+  ErlNifCond*   cond_started;
+  ErlNifMutex*  mutex_started;
 
-  driver_system_info(&si, sizeof(si));
-  if (!si.smp_support)
-    return -1;
+  (void)env;
+  (void)priv_data;
+  (void)load_info;
 
   if (peryl_create_vars())
     return -1;
 
-  if ((cond_started = erl_drv_cond_create("peryl_cond_started"))) {
-    if ((mutex_started = erl_drv_mutex_create("peryl_mutex_started"))) {
-      erl_drv_mutex_lock(mutex_started);
-      if (!(init_res = erl_drv_thread_create("peryl_main", &tid_main, peryl_py_thread, cond_started, NULL))) {
-        erl_drv_cond_wait(cond_started, mutex_started);
+  if ((cond_started = enif_cond_create("peryl_cond_started"))) {
+    if ((mutex_started = enif_mutex_create("peryl_mutex_started"))) {
+      enif_mutex_lock(mutex_started);
+      if (!(init_res = enif_thread_create("peryl_main", &tid_main, peryl_py_thread, cond_started, NULL))) {
+        enif_cond_wait(cond_started, mutex_started);
       }
-      erl_drv_mutex_unlock(mutex_started);
-      erl_drv_mutex_destroy(mutex_started);
+      enif_mutex_unlock(mutex_started);
+      enif_mutex_destroy(mutex_started);
     }
-    erl_drv_cond_destroy(cond_started);
+    enif_cond_destroy(cond_started);
   }
 
   if (init_res) {
@@ -99,62 +94,108 @@ int peryl_drv_init(void) {
 }
 
 static
-void peryl_drv_finish(void) {
-  erl_drv_cond_signal(cond_stop_requested);
-  erl_drv_thread_join(tid_main, NULL);
+void unload(ErlNifEnv* env, void* priv_data) {
+  (void)env;
+  (void)priv_data;
+  enif_cond_signal(cond_stop_requested);
+  enif_thread_join(tid_main, NULL);
   peryl_destroy_vars();
 }
 
 static
-ErlDrvData peryl_drv_start(ErlDrvPort port, char *buf) {
-  (void)buf;
-  peryl_drv_data *data = (peryl_drv_data*)driver_alloc_binary(sizeof(peryl_drv_data));
-  data->port = port;
-  return (ErlDrvData)data;
+ERL_NIF_TERM demo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  (void)argc;
+  (void)argv;
+
+  return enif_make_atom(env, "ok");
 }
 
-static
-void peryl_drv_stop(ErlDrvData handle) {
-  driver_free(handle);
-}
+typedef struct _peryl_task_state {
+  ErlNifEnv*     env;
+  ERL_NIF_TERM   script;
+  PyThreadState* py_thread_state;
+} peryl_task_state;
+
 
 static
-ErlDrvEntry peryl_driver_entry = {
-  peryl_drv_init,			/* F_PTR init, called when driver is loaded */
-  peryl_drv_start,		/* L_PTR start, called when port is opened */
-  peryl_drv_stop,		/* F_PTR stop, called when port is closed */
-  NULL,		/* F_PTR output, called when erlang has sent */
-  NULL,			/* F_PTR ready_input, called when input descriptor ready */
-  NULL,			/* F_PTR ready_output, called when output descriptor ready */
-  "peryl",		/* char *driver_name, the argument to open_port */
-  peryl_drv_finish,			/* F_PTR finish, called when unloaded */
-  NULL,                       /* void *handle, Reserved by VM */
-  NULL,			/* F_PTR control, port_command callback */
-  NULL,			/* F_PTR timeout, reserved */
-  NULL,			/* F_PTR outputv, reserved */
-  NULL,                       /* F_PTR ready_async, only for async drivers */
-  NULL,                       /* F_PTR flush, called when port is about
-                                 to be closed, but there is data in driver
-                                 queue */
-  NULL,                       /* F_PTR call, much like control, sync call
-                                 to driver */
-  NULL,                       /* F_PTR event, called when an event selected
-                                 by driver_event() occurs. */
-  ERL_DRV_EXTENDED_MARKER,    /* int extended marker, Should always be
-                                 set to indicate driver versioning */
-  ERL_DRV_EXTENDED_MAJOR_VERSION, /* int major_version, should always be
-                                     set to this value */
-  ERL_DRV_EXTENDED_MINOR_VERSION, /* int minor_version, should always be
-                                     set to this value */
-  0,                          /* int driver_flags, see documentation */
-  NULL,                       /* void *handle2, reserved for VM use */
-  NULL,                       /* F_PTR process_exit, called when a
-                                 monitored process dies */
-  NULL,                       /* F_PTR stop_select, called to close an
-                                 event object */
-  NULL
+void* peryl_task_thread(void* arg) {
+
+  FILE* fp = NULL;
+  char  filename[256];
+
+  peryl_task_state* pts = (peryl_task_state*)arg;
+
+  if (enif_get_string(pts->env, pts->script, filename, sizeof(filename) - 1, ERL_NIF_LATIN1) <= 0)
+    goto done;
+
+  if (!(fp = fopen(filename, "r")))
+    goto done;
+
+  PyEval_AcquireLock();
+  pts->py_thread_state = Py_NewInterpreter();
+  if (!pts->py_thread_state)
+    goto failed;
+
+  PyRun_SimpleFile(fp, filename);
+
+ failed:
+  if (pts->py_thread_state)
+    Py_EndInterpreter(pts->py_thread_state);
+  PyEval_ReleaseLock();
+
+ done:
+  if (fp)
+    fclose(fp);
+
+  enif_free_env(pts->env);
+  enif_free(pts);
+
+  return NULL;
+}
+
+
+static
+ERL_NIF_TERM run(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  (void)argv;
+
+  ERL_NIF_TERM res;
+
+  peryl_task_state* pts = NULL;
+  if (argc != 1) {
+    res = enif_make_badarg(env);
+    goto failed;
+  }
+
+  if (!(pts = (peryl_task_state*)enif_alloc(sizeof(pts))))
+    goto failed;
+
+  pts->env    = enif_alloc_env();
+  pts->script = enif_make_copy(pts->env, argv[0]);
+  pts->py_thread_state = NULL;
+
+  ErlNifTid tid_task;
+  if (enif_thread_create(NULL, &tid_task, peryl_task_thread, pts, NULL))
+    goto failed;
+
+  res = enif_make_atom(env, "ok");
+  goto done;
+
+ failed:
+  if (pts) {
+    enif_free_env(pts->env);
+    enif_free(pts);
+  }
+  res = enif_make_atom(env, "failed");
+
+ done:
+  return res;
+
+}
+
+
+static ErlNifFunc funcs[] = {
+  {"demo", 0, demo, 0},
+  {"run",  1, run, 0}
 };
 
-DRIVER_INIT(peryl) {
-	return &peryl_driver_entry;
-}
+ERL_NIF_INIT(peryl, funcs, load, NULL, NULL, unload)
